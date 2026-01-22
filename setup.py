@@ -13,8 +13,10 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch',
-            ['launch/two_stage.launch.py']),
+        ('share/' + package_name + '/launch', [
+            'launch/two_stage.launch.py',
+            'launch/mlp.launch.py',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,6 +30,7 @@ setup(
     entry_points={
         'console_scripts': [
             'realtime_monitor_two_stage = self_detection.realtime_monitor_two_stage:main',
+            'realtime_monitor_mlp = self_detection.realtime_monitor_mlp:main',
         ],
     },
 )

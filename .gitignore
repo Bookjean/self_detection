@@ -1,18 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Conda / venv
+.env
+.conda
+env/
+venv/
+ybvenv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training artifacts
+models/
+checkpoints/
+logs/
+
+# Egg / build
+*.egg-info/
+*.egg
 build/
+dist/
+
+# ROS2 / Colcon
 install/
 log/
-*.pyc
-__pycache__/
-
-# 가상환경
-ybvenv/
-venv/
-env/
-
-# Python 패키지 빌드 파일
-*.egg-info/
-dist/
-*.egg
 
 # IDE
 .vscode/
@@ -23,3 +38,4 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+

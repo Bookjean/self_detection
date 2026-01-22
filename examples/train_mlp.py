@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""MLP Training Script for Self Detection (Stage 1 Only).
+
+Learns posture-dependent baseline: b̂(q)
+Compensation: y_corrected = raw - b̂(q)
+
+Input:  6 joint angles (j1-j6)
+Output: 4 raw sensor values (raw1-raw4)
+
+Usage:
+    python train_mlp.py                        # Interactive mode
+    python train_mlp.py --auto                 # Use defaults
+    python train_mlp.py --data Data.txt --epochs 300
+"""
+
+import sys
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
+from pathlib import Path
+from datetime import datetime
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from self_detection_mlp.model import Stage1StaticOffsetMLP
+from self_detection_mlp.data_loader import DataLoaderFactory
+
+
+def print_banner():
+    print()
+    print("=" * 60)
+    print("   MLP Training for Self Detection")
+    print("   Input:  6 joint angles (j1-j6)")
+    print("   Output: 4 raw sensors (raw1-raw4)")
+    print("=" * 60)
+
+
+def find_data_files(project_root: Path) -> list:
+    """Find available data files."""
+    data_files = []
+    for pattern in ["*.txt", "*.csv", "data/*.txt", "data/*.csv"]:
+        data_files.extend(project_root.glob(pattern))
+    # Filter out non-data files
+    data_files = [f for f in data_files if not f.name.startswith('.')]
+    return sorted(set(data_files))
+
+
+def select_from_list(options: list, prompt: str, default: int = 0) -> int:
+    """Interactive selection from list."""
+    print(f"\n{prompt}")
+    print("-" * 50)
+    for i, opt in enumerate(options):
+        marker = " (default)" if i == default else ""
+        print(f"  [{i}] {opt}{marker}")
+
+    while True:
+        try:
+            choice = input(f"\nSelect [0-{len(options)-1}] (Enter for default): ").strip()
+            if choice == "":
+                return default
+            idx = int(choice)
+            if 0 <= idx < len(options):
+                return idx
+            print(f"Invalid. Enter 0-{len(options)-1}")
+        except ValueError:
+            print("Please enter a number.")
+
+
+def get_user_config(project_root: Path) -> dict:
+    """Get configuration interactively."""
+    config = {}
+
+    # 1. Select data file
+    data_files = find_data_files(project_root)
+    if not data_files:
+        print("Error: No data files found.")
+        sys.exit(1)
+
+    data_options = [str(f.relative_to(project_root)) for f in data_files]
+    idx = select_from_list(data_options, "Select Data File:", default=0)
+    config["data_file"] = str(data_files[idx])
+
+    # 2. Model architecture
+    print("\nModel Architecture (press Enter for defaults):")
+    print("-" * 50)
+
+    hidden_dim = input("  Hidden dimension [32]: ").strip()
+    config["hidden_dim"] = int(hidden_dim) if hidden_dim else 32
+
+    num_layers = input("  Number of hidden layers [3]: ").strip()
+    config["num_layers"] = int(num_layers) if num_layers else 3
+
+    # 3. Training parameters
+    print("\nTraining Parameters:")
+    print("-" * 50)
+
+    epochs = input("  Epochs [200]: ").strip()
+    config["epochs"] = int(epochs) if epochs else 200
+
+    batch_size = input("  Batch size [64]: ").strip()
+    config["batch_size"] = int(batch_size) if batch_size else 64
+
+    lr = input("  Learning rate [0.001]: ").strip()
+    config["learning_rate"] = float(lr) if lr else 0.001
+
+    train_ratio = input("  Train ratio [0.7]: ").strip()
+    config["train_ratio"] = float(train_ratio) if train_ratio else 0.7
+
+    seed = input("  Random seed [42]: ").strip()
+    config["seed"] = int(seed) if seed else 42
+
+    return config
+
+
+def train_mlp(config: dict, project_root: Path):
+    """Train MLP model."""
+
+    # Set seed
+    np.random.seed(config["seed"])
+    torch.manual_seed(config["seed"])
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("\n" + "=" * 60)
+    print("Configuration")
+    print("=" * 60)
+    for k, v in config.items():
+        print(f"  {k:20s}: {v}")
+    print(f"  {'device':20s}: {device}")
+    print("=" * 60)
+
+    # ========== Load Data ==========
+    print("\n[1/4] Loading data...")
+    factory = DataLoaderFactory(config["data_file"])
+    data_info = factory.get_info()
+    print(f"  Loaded {data_info['num_samples']} samples")
+    print(f"  Input shape:  {data_info['input_shape']}")
+    print(f"  Output shape: {data_info['output_shape']}")
+
+    # Create dataloaders
+    train_loader, val_loader, loader_info = factory.create_dataloaders(
+        loader_type="standard",
+        train_ratio=config["train_ratio"],
+        batch_size=config["batch_size"],
+        shuffle_train=True,
+        normalize=True,
+        seed=config["seed"],
+    )
+
+    print(f"  Train samples: {loader_info['train_samples']}")
+    print(f"  Val samples:   {loader_info['val_samples']}")
+
+    # ========== Create Model ==========
+    print("\n[2/4] Creating model...")
+    model = Stage1StaticOffsetMLP(
+        input_dim=6,
+        output_dim=4,
+        hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+    )
+    model = model.to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Architecture: 6 -> {config['hidden_dim']}x{config['num_layers']} -> 4")
+    print(f"  Parameters:   {total_params:,}")
+
+    # ========== Training ==========
+    print("\n[3/4] Training...")
+    print("-" * 60)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+    criterion = nn.MSELoss()
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    patience = 30
+    best_state = None
+    history = {"train_loss": [], "val_loss": []}
+
+    for epoch in range(config["epochs"]):
+        # Train
+        model.train()
+        train_losses = []
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            optimizer.zero_grad()
+            y_pred = model(X_batch)
+            loss = criterion(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        # Validate
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.to(device)
+                y_pred = model(X_batch)
+                loss = criterion(y_pred, y_batch)
+                val_losses.append(loss.item())
+
+        train_loss = np.mean(train_losses)
+        val_loss = np.mean(val_losses)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience_counter += 1
+
+        # Print progress
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:4d}/{config['epochs']} | "
+                  f"Train: {train_loss:.6f} | Val: {val_loss:.6f}")
+
+        if patience_counter >= patience:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    # Restore best model
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    print("-" * 60)
+    print(f"  Best validation loss: {best_val_loss:.6f}")
+
+    # ========== Save Model ==========
+    print("\n[4/4] Saving model...")
+
+    output_dir = project_root / "models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"stage1_mlp_{timestamp}.pth"
+    filepath = output_dir / filename
+
+    # Get normalization params
+    norm_params = factory.get_norm_params()
+
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "model_config": model.get_config(),
+        "norm_params": norm_params,
+        "training_config": config,
+        "best_val_loss": best_val_loss,
+        "history": history,
+    }, filepath)
+
+    print(f"  Saved: {filename}")
+    print(f"  Path:  {filepath}")
+
+    # ========== Summary ==========
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"Model:      Stage1 MLP ({config['hidden_dim']}x{config['num_layers']})")
+    print(f"Val Loss:   {best_val_loss:.6f}")
+    print(f"Output:     {filepath}")
+    print("=" * 60)
+    print("\nTo use in realtime:")
+    print(f"  ros2 launch self_detection mlp.launch.py model_file:={filename}")
+    print("=" * 60)
+
+    return model, norm_params, best_val_loss
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="MLP Training for Self Detection")
+    parser.add_argument("--auto", action="store_true", help="Use default settings")
+    parser.add_argument("--data", type=str, default=None, help="Data file path")
+    parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden layer dimension")
+    parser.add_argument("--num-layers", type=int, default=3, help="Number of hidden layers")
+    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--train-ratio", type=float, default=0.7, help="Train/total ratio")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    project_root = Path(__file__).parent.parent
+
+    print_banner()
+
+    if args.auto:
+        # Auto mode with command line args
+        data_file = args.data
+        if data_file is None:
+            data_files = find_data_files(project_root)
+            if data_files:
+                data_file = str(data_files[0])
+            else:
+                print("Error: No data file found. Use --data to specify.")
+                sys.exit(1)
+
+        config = {
+            "data_file": data_file,
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "train_ratio": args.train_ratio,
+            "seed": args.seed,
+        }
+    else:
+        # Interactive mode
+        config = get_user_config(project_root)
+
+    train_mlp(config, project_root)
+
+
+if __name__ == "__main__":
+    main()

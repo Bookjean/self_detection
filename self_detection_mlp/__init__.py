@@ -11,17 +11,7 @@ __author__ = "Robot Sensing Lab"
 
 from .data_loader import DataLoader
 from .preprocessing import OutputNormalizer, prepare_training_data, save_normalization_params
-from .model import (
-    Stage1StaticOffsetMLP,
-    Stage2ResidualMemoryMLP,
-    Stage2ResidualTCN,
-    SelfDetectionMLP,
-    SimpleMLP,
-    DeepMLP,
-    TCNBlock,
-    TCN,
-    TCNLight,
-)
+from .model import Stage1StaticOffsetMLP, Stage2ResidualMemoryMLP, SelfDetectionMLP
 from .trainer import Trainer
 from .evaluator import Evaluator
 
@@ -32,13 +22,7 @@ __all__ = [
     "save_normalization_params",
     "Stage1StaticOffsetMLP",
     "Stage2ResidualMemoryMLP",
-    "Stage2ResidualTCN",
     "SelfDetectionMLP",
-    "SimpleMLP",
-    "DeepMLP",
-    "TCNBlock",
-    "TCN",
-    "TCNLight",
     "Trainer",
     "Evaluator",
 ]
