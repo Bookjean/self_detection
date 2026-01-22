@@ -3,3 +3,23 @@ install/
 log/
 *.pyc
 __pycache__/
+
+# 가상환경
+ybvenv/
+venv/
+env/
+
+# Python 패키지 빌드 파일
+*.egg-info/
+dist/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
