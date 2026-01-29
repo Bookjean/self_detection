@@ -41,10 +41,38 @@ def print_banner():
 
 
 def find_data_files(project_root: Path) -> list:
+    """Find available data files.
+    
+    Priority:
+    1. robot_data_*.txt files (new format with date/time)
+    2. Other *.txt, *.csv files
+    """
     data_files = []
+    
+    # 우선순위 1: robot_data_*.txt 파일들 (날짜/시간 포함)
+    robot_data_files = list(project_root.glob("robot_data_*.txt"))
+    if robot_data_files:
+        # 최신 파일이 먼저 오도록 정렬 (날짜/시간 기준)
+        robot_data_files = sorted(robot_data_files, reverse=True)
+        data_files.extend(robot_data_files)
+    
+    # 우선순위 2: 기타 데이터 파일들
     for pattern in ["*.txt", "*.csv", "data/*.txt", "data/*.csv"]:
-        data_files.extend(project_root.glob(pattern))
-    return sorted(set(data_files))
+        found = project_root.glob(pattern)
+        for f in found:
+            # robot_data_*.txt는 이미 추가했으므로 제외
+            if not f.name.startswith('robot_data_') and not f.name.startswith('.'):
+                data_files.append(f)
+    
+    # 중복 제거 및 정렬
+    data_files = sorted(set(data_files), key=lambda x: (
+        # robot_data_ 파일을 우선순위로
+        0 if x.name.startswith('robot_data_') else 1,
+        # 그 다음은 파일명으로 정렬
+        x.name
+    ))
+    
+    return data_files
 
 
 def select_from_list(options: list, prompt: str, default: int = 0) -> int:

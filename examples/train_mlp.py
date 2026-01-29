@@ -1,291 +1,301 @@
 #!/usr/bin/env python3
-"""MLP Training Script for Self Detection (Stage 1 Only).
+# -*- coding: utf-8 -*-
+"""
+Stage 1 Self-Detection Field MLP Training Script
 
-Learns posture-dependent baseline: b̂(q)
-Compensation: y_corrected = raw - b̂(q)
+[CONCEPT - SINGLE LINEAGE]
+- Input  : 6 joint angles (q)        ※ no normalization
+- Output : N proximity sensors       ※ normalized by (raw - BASE) / SCALE
+- Model  : Stage1SelfDetectionFieldMLP (256-256-128)
 
-Input:  6 joint angles (j1-j6)
-Output: 4 raw sensor values (raw1-raw4)
+The model learns:
+    ŝ_norm(q) ≈ (s_raw(q) - BASE) / SCALE
 
-Usage:
-    python train_mlp.py                        # Interactive mode
-    python train_mlp.py --auto                 # Use defaults
-    python train_mlp.py --data Data.txt --epochs 300
+Compensation (runtime):
+    y_comp = y_raw - (ŝ_raw - BASE)
 """
 
 import sys
 import argparse
-import numpy as np
-import torch
-import torch.nn as nn
 from pathlib import Path
 from datetime import datetime
 
+import numpy as np
+import torch
+import torch.nn as nn
+
+# project import
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from self_detection_mlp.model import Stage1StaticOffsetMLP
+from self_detection_mlp.model import (
+    Stage1SelfDetectionFieldMLP,
+    OutputNormSpec,
+)
 from self_detection_mlp.data_loader import DataLoaderFactory
 
 
+# ============================================================
+# Constants
+# ============================================================
+N_JOINTS = 6
+BASE_VALUE = 4e7
+SCALE_VALUE = 1e6
+
+
+# ============================================================
+# Utilities
+# ============================================================
 def print_banner():
-    print()
-    print("=" * 60)
-    print("   MLP Training for Self Detection")
-    print("   Input:  6 joint angles (j1-j6)")
-    print("   Output: 4 raw sensors (raw1-raw4)")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print(" Stage 1 Self-Detection Field MLP Training")
+    print(" Input : 6 joint angles (NO normalization)")
+    print(" Output: N sensors, normalized by (raw - BASE) / SCALE")
+    print(" Model : 256-256-128 MLP")
+    print("=" * 70)
 
 
-def find_data_files(project_root: Path) -> list:
-    """Find available data files."""
-    data_files = []
-    for pattern in ["*.txt", "*.csv", "data/*.txt", "data/*.csv"]:
-        data_files.extend(project_root.glob(pattern))
-    # Filter out non-data files
-    data_files = [f for f in data_files if not f.name.startswith('.')]
-    return sorted(set(data_files))
+# ============================================================
+# Training
+# ============================================================
+def train_stage1(config: dict, project_root: Path):
 
-
-def select_from_list(options: list, prompt: str, default: int = 0) -> int:
-    """Interactive selection from list."""
-    print(f"\n{prompt}")
-    print("-" * 50)
-    for i, opt in enumerate(options):
-        marker = " (default)" if i == default else ""
-        print(f"  [{i}] {opt}{marker}")
-
-    while True:
-        try:
-            choice = input(f"\nSelect [0-{len(options)-1}] (Enter for default): ").strip()
-            if choice == "":
-                return default
-            idx = int(choice)
-            if 0 <= idx < len(options):
-                return idx
-            print(f"Invalid. Enter 0-{len(options)-1}")
-        except ValueError:
-            print("Please enter a number.")
-
-
-def get_user_config(project_root: Path) -> dict:
-    """Get configuration interactively."""
-    config = {}
-
-    # 1. Select data file
-    data_files = find_data_files(project_root)
-    if not data_files:
-        print("Error: No data files found.")
-        sys.exit(1)
-
-    data_options = [str(f.relative_to(project_root)) for f in data_files]
-    idx = select_from_list(data_options, "Select Data File:", default=0)
-    config["data_file"] = str(data_files[idx])
-
-    # 2. Model architecture
-    print("\nModel Architecture (press Enter for defaults):")
-    print("-" * 50)
-
-    hidden_dim = input("  Hidden dimension [32]: ").strip()
-    config["hidden_dim"] = int(hidden_dim) if hidden_dim else 32
-
-    num_layers = input("  Number of hidden layers [3]: ").strip()
-    config["num_layers"] = int(num_layers) if num_layers else 3
-
-    # 3. Training parameters
-    print("\nTraining Parameters:")
-    print("-" * 50)
-
-    epochs = input("  Epochs [200]: ").strip()
-    config["epochs"] = int(epochs) if epochs else 200
-
-    batch_size = input("  Batch size [64]: ").strip()
-    config["batch_size"] = int(batch_size) if batch_size else 64
-
-    lr = input("  Learning rate [0.001]: ").strip()
-    config["learning_rate"] = float(lr) if lr else 0.001
-
-    train_ratio = input("  Train ratio [0.7]: ").strip()
-    config["train_ratio"] = float(train_ratio) if train_ratio else 0.7
-
-    seed = input("  Random seed [42]: ").strip()
-    config["seed"] = int(seed) if seed else 42
-
-    return config
-
-
-def train_mlp(config: dict, project_root: Path):
-    """Train MLP model."""
-
-    # Set seed
+    # -------------------------
+    # Reproducibility
+    # -------------------------
     np.random.seed(config["seed"])
     torch.manual_seed(config["seed"])
 
-    # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("\n" + "=" * 60)
-    print("Configuration")
-    print("=" * 60)
+    print("\n[CONFIGURATION]")
     for k, v in config.items():
-        print(f"  {k:20s}: {v}")
-    print(f"  {'device':20s}: {device}")
-    print("=" * 60)
+        print(f"  {k:18s}: {v}")
+    print(f"  {'device':18s}: {device}")
 
-    # ========== Load Data ==========
+    # -------------------------
+    # Load data
+    # -------------------------
     print("\n[1/4] Loading data...")
-    factory = DataLoaderFactory(config["data_file"])
-    data_info = factory.get_info()
-    print(f"  Loaded {data_info['num_samples']} samples")
-    print(f"  Input shape:  {data_info['input_shape']}")
-    print(f"  Output shape: {data_info['output_shape']}")
+    factory = DataLoaderFactory(
+        config["data_file"],
+        num_sensors=config["num_sensors"],
+    )
 
-    # Create dataloaders
+    data_info = factory.get_info()
+    output_dim = data_info["output_shape"][1]
+
+    print(f"  Samples      : {data_info['num_samples']}")
+    print(f"  Input shape  : {data_info['input_shape']}")
+    print(f"  Output shape : {data_info['output_shape']}")
+
+    # output normalization ONLY (baseline-based)
+    norm = OutputNormSpec(
+        baseline=BASE_VALUE,
+        scale=SCALE_VALUE,
+    )
+
     train_loader, val_loader, loader_info = factory.create_dataloaders(
         loader_type="standard",
         train_ratio=config["train_ratio"],
         batch_size=config["batch_size"],
         shuffle_train=True,
-        normalize=True,
+        normalize=False,   # 🔴 DataLoader의 정규화 사용 안 함
         seed=config["seed"],
     )
 
     print(f"  Train samples: {loader_info['train_samples']}")
-    print(f"  Val samples:   {loader_info['val_samples']}")
+    print(f"  Val samples  : {loader_info['val_samples']}")
 
-    # ========== Create Model ==========
+    # -------------------------
+    # Model
+    # -------------------------
     print("\n[2/4] Creating model...")
-    model = Stage1StaticOffsetMLP(
-        input_dim=6,
-        output_dim=4,
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-    )
-    model = model.to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Architecture: 6 -> {config['hidden_dim']}x{config['num_layers']} -> 4")
-    print(f"  Parameters:   {total_params:,}")
+    model = Stage1SelfDetectionFieldMLP(
+        input_dim=N_JOINTS,
+        output_dim=output_dim,
+        hidden_dims=(256, 256, 128),
+        activation="relu",
+        dropout=0.0,
+    ).to(device)
 
-    # ========== Training ==========
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"  Architecture : 6 -> 256 -> 256 -> 128 -> {output_dim}")
+    print(f"  Parameters  : {num_params:,}")
+
+    # -------------------------
+    # Optimization (train_self_detection.py 스타일)
+    # -------------------------
     print("\n[3/4] Training...")
-    print("-" * 60)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config.get("weight_decay", 1e-5),
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10
+    )
     criterion = nn.MSELoss()
 
-    best_val_loss = float('inf')
-    patience_counter = 0
-    patience = 30
+    best_val = float("inf")
     best_state = None
-    history = {"train_loss": [], "val_loss": []}
+    best_epoch = 0
+    patience = config.get("patience", 30)
+    wait = 0
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_rmse_raw": [],
+        "learning_rate": [],
+    }
 
     for epoch in range(config["epochs"]):
-        # Train
+        # -------- Train --------
         model.train()
         train_losses = []
-        for X_batch, y_batch in train_loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
+
+        for X, y_raw in train_loader:
+            X = X[:, :N_JOINTS].to(device)     # joint angles only
+            y_raw = y_raw.to(device)
+
+            # baseline-based normalization
+            y_norm = norm.normalize(y_raw)
 
             optimizer.zero_grad()
-            y_pred = model(X_batch)
-            loss = criterion(y_pred, y_batch)
+            y_pred = model(X)
+            loss = criterion(y_pred, y_norm)
             loss.backward()
+            
+            # Gradient clipping (train_self_detection.py 스타일)
+            grad_clip = config.get("grad_clip", 1.0)
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            
             optimizer.step()
+
             train_losses.append(loss.item())
 
-        # Validate
+        # -------- Validate --------
         model.eval()
         val_losses = []
+        rmse_list = []
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch = X_batch.to(device)
-                y_batch = y_batch.to(device)
-                y_pred = model(X_batch)
-                loss = criterion(y_pred, y_batch)
-                val_losses.append(loss.item())
+            for X, y_raw in val_loader:
+                X = X[:, :N_JOINTS].to(device)
+                y_raw = y_raw.to(device)
+                y_norm = norm.normalize(y_raw)
 
-        train_loss = np.mean(train_losses)
-        val_loss = np.mean(val_losses)
+                y_pred = model(X)
+                loss = criterion(y_pred, y_norm)
+                val_losses.append(loss.item())
+                
+                # RMSE on raw scale (more interpretable)
+                y_pred_raw = norm.denormalize(y_pred)
+                rmse = torch.sqrt(torch.mean((y_pred_raw - y_raw) ** 2)).item()
+                rmse_list.append(rmse)
+
+        train_loss = float(np.mean(train_losses))
+        val_loss = float(np.mean(val_losses))
+        val_rmse_raw = float(np.mean(rmse_list)) if rmse_list else float("inf")
+
+        # Scheduler step (validation loss 기준)
+        old_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(val_loss)
+        new_lr = optimizer.param_groups[0]['lr']
+        if new_lr != old_lr:
+            print(f"Learning rate reduced: {old_lr:.6f} → {new_lr:.6f}")
+
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["val_rmse_raw"].append(val_rmse_raw)
+        history["learning_rate"].append(float(new_lr))
 
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
+        if val_loss < best_val:
+            best_val = val_loss
+            best_epoch = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
         else:
-            patience_counter += 1
+            wait += 1
 
-        # Print progress
-        if (epoch + 1) % 20 == 0 or epoch == 0:
-            print(f"  Epoch {epoch+1:4d}/{config['epochs']} | "
-                  f"Train: {train_loss:.6f} | Val: {val_loss:.6f}")
+        # Print progress (train_self_detection.py 스타일)
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(
+                f"Epoch {epoch+1:3d}/{config['epochs']} | "
+                f"Train {train_loss:.6e} | Val {val_loss:.6e} | "
+                f"ValRMSE(raw) {val_rmse_raw:.1f} | LR {new_lr:.2e}"
+            )
 
-        if patience_counter >= patience:
-            print(f"  Early stopping at epoch {epoch+1}")
+        if wait >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
             break
 
-    # Restore best model
+    # restore best
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    print("-" * 60)
-    print(f"  Best validation loss: {best_val_loss:.6f}")
+    print(f"\nBest validation loss: {best_val:.6e}")
 
-    # ========== Save Model ==========
+    # -------------------------
+    # Save model
+    # -------------------------
     print("\n[4/4] Saving model...")
 
-    output_dir = project_root / "models"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = project_root / "models"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"stage1_mlp_{timestamp}.pth"
-    filepath = output_dir / filename
+    filename = f"stage1_self_detection_{timestamp}.pth"
+    path = out_dir / filename
 
-    # Get normalization params
-    norm_params = factory.get_norm_params()
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": model.get_config(),
+            "output_norm": {
+                "baseline": BASE_VALUE,
+                "scale": SCALE_VALUE,
+            },
+            "training_config": config,
+            "best_val_loss": best_val,
+            "best_epoch": best_epoch,
+            "history": history,
+        },
+        path,
+    )
 
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "model_config": model.get_config(),
-        "norm_params": norm_params,
-        "training_config": config,
-        "best_val_loss": best_val_loss,
-        "history": history,
-    }, filepath)
+    print(f"  Saved model: {path}")
+    print(f"  Best epoch: {best_epoch+1}, best val_loss: {best_val:.6e}")
+    print("\nTRAINING COMPLETE")
 
-    print(f"  Saved: {filename}")
-    print(f"  Path:  {filepath}")
-
-    # ========== Summary ==========
-    print("\n" + "=" * 60)
-    print("TRAINING COMPLETE")
-    print("=" * 60)
-    print(f"Model:      Stage1 MLP ({config['hidden_dim']}x{config['num_layers']})")
-    print(f"Val Loss:   {best_val_loss:.6f}")
-    print(f"Output:     {filepath}")
-    print("=" * 60)
-    print("\nTo use in realtime:")
-    print(f"  ros2 launch self_detection mlp.launch.py model_file:={filename}")
-    print("=" * 60)
-
-    return model, norm_params, best_val_loss
+    return model, best_val
 
 
+# ============================================================
+# CLI
+# ============================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="MLP Training for Self Detection")
-    parser.add_argument("--auto", action="store_true", help="Use default settings")
-    parser.add_argument("--data", type=str, default=None, help="Data file path")
-    parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden layer dimension")
-    parser.add_argument("--num-layers", type=int, default=3, help="Number of hidden layers")
-    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
-    parser.add_argument("--train-ratio", type=float, default=0.7, help="Train/total ratio")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser = argparse.ArgumentParser(
+        description="Stage1 Self-Detection Field MLP Training"
+    )
+    parser.add_argument("--data", type=str, default=None, help="Data file path. If omitted, uses latest robot_data_*.txt")
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-5, help="L2 regularization")
+    parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-sensors", type=int, default=8)
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping max norm")
+    parser.add_argument("--patience", type=int, default=30, help="Early stopping patience")
     return parser.parse_args()
+
+def _find_latest_robot_data(project_root: Path) -> str | None:
+    candidates = sorted(project_root.glob("robot_data_*.txt"), reverse=True)
+    if not candidates:
+        return None
+    return str(candidates[0])
 
 
 def main():
@@ -294,32 +304,28 @@ def main():
 
     print_banner()
 
-    if args.auto:
-        # Auto mode with command line args
-        data_file = args.data
-        if data_file is None:
-            data_files = find_data_files(project_root)
-            if data_files:
-                data_file = str(data_files[0])
-            else:
-                print("Error: No data file found. Use --data to specify.")
-                sys.exit(1)
+    data_path = args.data
+    if not data_path:
+        data_path = _find_latest_robot_data(project_root)
+        if not data_path:
+            print("[ERROR] --data not provided and no robot_data_*.txt found in project root.")
+            sys.exit(1)
+        print(f"[INFO] Using latest data file: {Path(data_path).name}")
 
-        config = {
-            "data_file": data_file,
-            "hidden_dim": args.hidden_dim,
-            "num_layers": args.num_layers,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.lr,
-            "train_ratio": args.train_ratio,
-            "seed": args.seed,
-        }
-    else:
-        # Interactive mode
-        config = get_user_config(project_root)
+    config = {
+        "data_file": data_path,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "train_ratio": args.train_ratio,
+        "seed": args.seed,
+        "num_sensors": args.num_sensors,
+        "grad_clip": args.grad_clip,
+        "patience": args.patience,
+    }
 
-    train_mlp(config, project_root)
+    train_stage1(config, project_root)
 
 
 if __name__ == "__main__":

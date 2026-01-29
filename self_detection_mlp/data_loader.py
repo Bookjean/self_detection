@@ -15,22 +15,22 @@ class DataLoader:
     Expected data format (CSV or TXT with # comments):
         timestamp,
         j1, j2, j3, j4, j5, j6,
-        prox1, prox2, prox3, prox4,
-        raw1, raw2, raw3, raw4,
-        tof1, tof2, tof3, tof4
+        prox1, prox2, prox3, prox4, prox5, prox6, prox7, prox8,
+        raw1, raw2, raw3, raw4, raw5, raw6, raw7, raw8,
+        tof1, tof2, tof3, tof4, tof5, tof6, tof7, tof8
     """
 
     COLUMN_NAMES = [
         "timestamp",
         "j1", "j2", "j3", "j4", "j5", "j6",
-        "prox1", "prox2", "prox3", "prox4",
-        "raw1", "raw2", "raw3", "raw4",
-        "tof1", "tof2", "tof3", "tof4"
+        "prox1", "prox2", "prox3", "prox4", "prox5", "prox6", "prox7", "prox8",
+        "raw1", "raw2", "raw3", "raw4", "raw5", "raw6", "raw7", "raw8",
+        "tof1", "tof2", "tof3", "tof4", "tof5", "tof6", "tof7", "tof8"
     ]
     JOINT_COLUMNS = ["j1", "j2", "j3", "j4", "j5", "j6"]
-    RAW_SENSOR_COLUMNS = ["raw1", "raw2", "raw3", "raw4"]
-    PROX_SENSOR_COLUMNS = ["prox1", "prox2", "prox3", "prox4"]
-    TOF_COLUMNS = ["tof1", "tof2", "tof3", "tof4"]
+    RAW_SENSOR_COLUMNS = ["raw1", "raw2", "raw3", "raw4", "raw5", "raw6", "raw7", "raw8"]
+    PROX_SENSOR_COLUMNS = ["prox1", "prox2", "prox3", "prox4", "prox5", "prox6", "prox7", "prox8"]
+    TOF_COLUMNS = ["tof1", "tof2", "tof3", "tof4", "tof5", "tof6", "tof7", "tof8"]
 
     def __init__(self, file_path: str):
         """Initialize DataLoader.
@@ -103,15 +103,27 @@ class DataLoader:
         else:
             return self.data[["j2", "j3", "j4", "j5", "j6"]].values  # j2-j6, shape (N, 5)
     
-    def get_raw_sensors(self) -> np.ndarray:
-        """Extract AKF-processed sensor outputs (raw1-raw4).
+    def get_raw_sensors(self, num_sensors: int = 4) -> np.ndarray:
+        """Extract AKF-processed sensor outputs (raw1-raw8 or raw1-raw4).
+        
+        Args:
+            num_sensors: Number of sensors to extract (4 or 8). Default: 4 for backward compatibility.
         
         Returns:
-            Shape: (N, 4)
+            Shape: (N, num_sensors) - raw1~raw4 if num_sensors=4, raw1~raw8 if num_sensors=8
         """
         if self.data is None:
             raise RuntimeError("Data not loaded. Call load() first.")
-        return self.data[self.RAW_SENSOR_COLUMNS].values
+        
+        if num_sensors == 4:
+            # Backward compatibility: return first 4 sensors
+            columns = ["raw1", "raw2", "raw3", "raw4"]
+        elif num_sensors == 8:
+            columns = self.RAW_SENSOR_COLUMNS
+        else:
+            raise ValueError(f"num_sensors must be 4 or 8, got {num_sensors}")
+        
+        return self.data[columns].values
     
     def get_timestamps(self) -> np.ndarray:
         """Extract timestamps.
@@ -332,19 +344,21 @@ class DataLoaderFactory:
         "no_shuffle": "No shuffling (preserves time order)",
     }
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, num_sensors: int = 4):
         """Initialize factory with data file.
 
         Args:
             file_path: Path to CSV/TXT data file
+            num_sensors: Number of sensors to use (4 or 8). Default: 4 for backward compatibility.
         """
         self.file_path = file_path
+        self.num_sensors = num_sensors
         self.data_loader = DataLoader(file_path)
         self.data_loader.load()
 
         # Extract data
         self.joint_angles = self.data_loader.get_joint_angles(use_all_joints=True)
-        self.raw_sensors = self.data_loader.get_raw_sensors()
+        self.raw_sensors = self.data_loader.get_raw_sensors(num_sensors=num_sensors)
 
         # Normalization parameters
         self.X_mean = None
@@ -392,10 +406,8 @@ class DataLoaderFactory:
         return y_norm * self.y_std + self.y_mean
 
     def get_norm_params(self) -> Dict:
-        """Get normalization parameters."""
+        """Get normalization parameters (output only)."""
         return {
-            "X_mean": self.X_mean,
-            "X_std": self.X_std,
             "y_mean": self.y_mean,
             "y_std": self.y_std,
         }
@@ -437,16 +449,16 @@ class DataLoaderFactory:
         X = self.joint_angles.copy()
         y = self.raw_sensors.copy()
 
-        # Split indices (preserving time order for split)
+        # Split indices
         n_samples = len(X)
         n_train = int(n_samples * train_ratio)
 
         if loader_type == "no_shuffle":
-            # Time-ordered split
+            # Time-ordered split (no randomization)
             train_idx = np.arange(n_train)
             val_idx = np.arange(n_train, n_samples)
         else:
-            # Random split (shuffle indices)
+            # Random split (shuffle indices for train/val split)
             indices = np.random.permutation(n_samples)
             train_idx = indices[:n_train]
             val_idx = indices[n_train:]
@@ -454,10 +466,15 @@ class DataLoaderFactory:
         X_train, y_train = X[train_idx], y[train_idx]
         X_val, y_val = X[val_idx], y[val_idx]
 
-        # Normalize using training data statistics
+        # Normalize only output (sensor values), not input (joint angles)
         if normalize:
-            X_train, y_train = self.normalize(X_train, y_train, fit=True)
-            X_val, y_val = self.normalize(X_val, y_val, fit=False)
+            # Only normalize y (sensor values), keep X (joint angles) as is
+            self.y_mean = np.mean(y_train, axis=0)
+            self.y_std = np.std(y_train, axis=0)
+            self.y_std = np.where(self.y_std == 0, 1.0, self.y_std)
+            
+            y_train = (y_train - self.y_mean) / self.y_std
+            y_val = (y_val - self.y_mean) / self.y_std
 
         # Create datasets
         if loader_type == "sequence":
@@ -490,6 +507,7 @@ class DataLoaderFactory:
             "batch_size": batch_size,
             "shuffle_train": shuffle_train,
             "normalized": normalize,
+            "train_val_split_randomized": loader_type != "no_shuffle",  # 랜덤화 여부 표시
         }
 
         return train_loader, val_loader, info

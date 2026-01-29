@@ -1,142 +1,247 @@
-"""Evaluation utilities for Self Detection model."""
+"""Evaluation utilities for Self Detection model (based on inference_self_detection.py structure)."""
 
 import numpy as np
 import torch
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
+from torch.utils.data import DataLoader
+
+from .model import OutputNormSpec
 
 
 class Evaluator:
-    """Evaluate Self Detection model performance.
+    """Evaluate Self Detection model performance (inference_self_detection.py style).
     
     Metrics:
-    - Standard deviation reduction per channel
-    - Peak-to-peak reduction per channel
+    - RMSE (Root Mean Squared Error) on raw scale
+    - MAE (Mean Absolute Error) on raw scale
+    - Per-channel metrics
+    - Compensation metrics
     """
     
     @staticmethod
-    def std_reduction(y_original: np.ndarray, 
-                      y_compensated: np.ndarray) -> np.ndarray:
-        """Compute standard deviation reduction per channel.
+    def compute_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        """Compute RMSE.
         
         Args:
-            y_original: Original sensor values, shape (N, 4)
-            y_compensated: Compensated sensor values (y_original - baseline), shape (N, 4)
+            y_true: True values, shape (N, C)
+            y_pred: Predicted values, shape (N, C)
             
         Returns:
-            Std reduction per channel, shape (4,). Values > 0 indicate improvement.
+            RMSE value
         """
-        std_original = np.std(y_original, axis=0)
-        std_compensated = np.std(y_compensated, axis=0)
-        
-        return std_original - std_compensated
+        return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
     
     @staticmethod
-    def peak_to_peak_reduction(y_original: np.ndarray,
-                               y_compensated: np.ndarray) -> np.ndarray:
-        """Compute peak-to-peak reduction per channel.
+    def compute_mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        """Compute MAE.
         
         Args:
-            y_original: Original sensor values, shape (N, 4)
-            y_compensated: Compensated sensor values, shape (N, 4)
-            
-        Returns:
-            Peak-to-peak reduction per channel, shape (4,).
-        """
-        ptp_original = np.ptp(y_original, axis=0)
-        ptp_compensated = np.ptp(y_compensated, axis=0)
-        
-        return ptp_original - ptp_compensated
-    
-    @staticmethod
-    def mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-        """Compute mean squared error.
-        
-        Args:
-            y_true: True values, shape (N, 4)
-            y_pred: Predicted values, shape (N, 4)
-            
-        Returns:
-            MSE value
-        """
-        return np.mean((y_true - y_pred) ** 2)
-    
-    @staticmethod
-    def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-        """Compute mean absolute error.
-        
-        Args:
-            y_true: True values, shape (N, 4)
-            y_pred: Predicted values, shape (N, 4)
+            y_true: True values, shape (N, C)
+            y_pred: Predicted values, shape (N, C)
             
         Returns:
             MAE value
         """
-        return np.mean(np.abs(y_true - y_pred))
+        return float(np.mean(np.abs(y_true - y_pred)))
     
     @staticmethod
-    def evaluate(y_original: np.ndarray,
-                y_baseline_pred: np.ndarray,
-                y_baseline_true: np.ndarray = None) -> Dict:
-        """Comprehensive evaluation.
+    def compute_compensation_metrics(
+        y_raw: np.ndarray,
+        y_pred_raw: np.ndarray,
+        norm_spec: OutputNormSpec,
+    ) -> Dict:
+        """Compute compensation metrics (inference_self_detection.py style).
         
         Args:
-            y_original: Original sensor readings, shape (N, 4)
-            y_baseline_pred: Predicted baseline, shape (N, 4)
-            y_baseline_true: Ground truth baseline (optional), shape (N, 4)
+            y_raw: Raw sensor measurements, shape (N, C)
+            y_pred_raw: Predicted raw values, shape (N, C)
+            norm_spec: Output normalization spec
+            
+        Returns:
+            Dictionary with compensation metrics
+        """
+        # Compensation: comp = measured - (pred_raw - BASE)
+        y_compensated = y_raw - (y_pred_raw - float(norm_spec.baseline))
+        
+        # Prediction error (raw scale)
+        pred_rmse = Evaluator.compute_rmse(y_raw, y_pred_raw)
+        pred_mae = Evaluator.compute_mae(y_raw, y_pred_raw)
+        
+        # Compensated signal statistics
+        comp_std = float(np.std(y_compensated, axis=0).mean())
+        raw_std = float(np.std(y_raw, axis=0).mean())
+        std_reduction = raw_std - comp_std
+        
+        comp_ptp = float(np.ptp(y_compensated, axis=0).mean())
+        raw_ptp = float(np.ptp(y_raw, axis=0).mean())
+        ptp_reduction = raw_ptp - comp_ptp
+        
+        return {
+            "pred_rmse": pred_rmse,
+            "pred_mae": pred_mae,
+            "compensated_std": comp_std,
+            "raw_std": raw_std,
+            "std_reduction": std_reduction,
+            "compensated_ptp": comp_ptp,
+            "raw_ptp": raw_ptp,
+            "ptp_reduction": ptp_reduction,
+        }
+    
+    @staticmethod
+    @torch.no_grad()
+    def evaluate_model(
+        model: torch.nn.Module,
+        dataloader: DataLoader,
+        norm_spec: OutputNormSpec,
+        device: torch.device,
+    ) -> Dict:
+        """Evaluate model on dataset (inference_self_detection.py style).
+        
+        Args:
+            model: Trained model
+            dataloader: Data loader
+            norm_spec: Output normalization spec
+            device: Device to use
             
         Returns:
             Dictionary with evaluation metrics
         """
-        y_compensated = y_original - y_baseline_pred
+        model.eval()
         
-        results = {
-            "std_reduction": Evaluator.std_reduction(y_original, y_compensated),
-            "ptp_reduction": Evaluator.peak_to_peak_reduction(y_original, y_compensated),
-            "original_std": np.std(y_original, axis=0),
-            "compensated_std": np.std(y_compensated, axis=0),
-            "original_ptp": np.ptp(y_original, axis=0),
-            "compensated_ptp": np.ptp(y_compensated, axis=0),
+        all_y_raw = []
+        all_y_pred_norm = []
+        
+        for X, y_raw in dataloader:
+            X = X[:, :6].to(device)  # joint angles only
+            y_raw = y_raw.to(device)
+            
+            # Predict (normalized)
+            y_pred_norm = model(X)
+            
+            all_y_raw.append(y_raw.cpu())
+            all_y_pred_norm.append(y_pred_norm.cpu())
+        
+        # Concatenate all batches
+        y_raw = torch.cat(all_y_raw, dim=0).numpy()
+        y_pred_norm = torch.cat(all_y_pred_norm, dim=0).numpy()
+        
+        # Denormalize predictions
+        y_pred_raw = norm_spec.denormalize(torch.from_numpy(y_pred_norm)).numpy()
+        
+        # Compute metrics
+        rmse = Evaluator.compute_rmse(y_raw, y_pred_raw)
+        mae = Evaluator.compute_mae(y_raw, y_pred_raw)
+        
+        # Compensation metrics
+        comp_metrics = Evaluator.compute_compensation_metrics(
+            y_raw, y_pred_raw, norm_spec
+        )
+        
+        return {
+            "rmse": rmse,
+            "mae": mae,
+            **comp_metrics,
         }
+    
+    @staticmethod
+    @torch.no_grad()
+    def evaluate_per_channel(
+        model: torch.nn.Module,
+        dataloader: DataLoader,
+        norm_spec: OutputNormSpec,
+        device: torch.device,
+        num_sensors: int = 8,
+    ) -> list:
+        """Evaluate model per channel (inference_self_detection.py style).
         
-        if y_baseline_true is not None:
-            results["baseline_mse"] = Evaluator.mse(y_baseline_true, y_baseline_pred)
-            results["baseline_mae"] = Evaluator.mae(y_baseline_true, y_baseline_pred)
+        Args:
+            model: Trained model
+            dataloader: Data loader
+            norm_spec: Output normalization spec
+            device: Device to use
+            num_sensors: Number of sensors
+            
+        Returns:
+            List of per-channel metrics
+        """
+        model.eval()
+        
+        all_y_raw = []
+        all_y_pred_norm = []
+        
+        for X, y_raw in dataloader:
+            X = X[:, :6].to(device)
+            y_raw = y_raw.to(device)
+            y_pred_norm = model(X)
+            all_y_raw.append(y_raw.cpu())
+            all_y_pred_norm.append(y_pred_norm.cpu())
+        
+        y_raw = torch.cat(all_y_raw, dim=0).numpy()
+        y_pred_norm = torch.cat(all_y_pred_norm, dim=0).numpy()
+        y_pred_raw = norm_spec.denormalize(torch.from_numpy(y_pred_norm)).numpy()
+        
+        results = []
+        for ch in range(min(num_sensors, y_raw.shape[1])):
+            ch_raw = y_raw[:, ch]
+            ch_pred = y_pred_raw[:, ch]
+            ch_error = np.abs(ch_raw - ch_pred)
+            
+            mae = float(np.mean(ch_error))
+            rmse = float(np.sqrt(np.mean(ch_error ** 2)))
+            max_err = float(np.max(ch_error))
+            
+            # Compensation metrics
+            ch_comp = ch_raw - (ch_pred - float(norm_spec.baseline))
+            comp_std = float(np.std(ch_comp))
+            raw_std = float(np.std(ch_raw))
+            std_reduction = raw_std - comp_std
+            
+            results.append({
+                "channel": ch,
+                "mae": mae,
+                "rmse": rmse,
+                "max_error": max_err,
+                "raw_std": raw_std,
+                "compensated_std": comp_std,
+                "std_reduction": std_reduction,
+            })
         
         return results
     
     @staticmethod
-    def print_report(eval_dict: Dict, channel_names: list = None) -> None:
+    def print_report(metrics: Dict, channel_metrics: Optional[list] = None) -> None:
         """Print evaluation report.
         
         Args:
-            eval_dict: Evaluation results from evaluate()
-            channel_names: Optional channel names (default: raw1, raw2, raw3, raw4)
+            metrics: Overall metrics dictionary
+            channel_metrics: Optional per-channel metrics list
         """
-        if channel_names is None:
-            channel_names = ["raw1", "raw2", "raw3", "raw4"]
-        
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("EVALUATION REPORT")
-        print("="*60)
+        print("=" * 60)
         
-        print("\nStandard Deviation Reduction (larger is better):")
-        for i, name in enumerate(channel_names):
-            std_red = eval_dict["std_reduction"][i]
-            print(f"  {name}: {std_red:.4f}")
+        print("\nOverall Metrics:")
+        print(f"  RMSE (raw): {metrics.get('rmse', 0):.1f}")
+        print(f"  MAE (raw): {metrics.get('mae', 0):.1f}")
+        print(f"  Prediction RMSE: {metrics.get('pred_rmse', 0):.1f}")
+        print(f"  Prediction MAE: {metrics.get('pred_mae', 0):.1f}")
         
-        print("\nPeak-to-Peak Reduction (larger is better):")
-        for i, name in enumerate(channel_names):
-            ptp_red = eval_dict["ptp_reduction"][i]
-            print(f"  {name}: {ptp_red:.4f}")
+        print("\nCompensation Metrics:")
+        print(f"  Raw std: {metrics.get('raw_std', 0):.1f}")
+        print(f"  Compensated std: {metrics.get('compensated_std', 0):.1f}")
+        print(f"  Std reduction: {metrics.get('std_reduction', 0):.1f}")
+        print(f"  Raw ptp: {metrics.get('raw_ptp', 0):.1f}")
+        print(f"  Compensated ptp: {metrics.get('compensated_ptp', 0):.1f}")
+        print(f"  Ptp reduction: {metrics.get('ptp_reduction', 0):.1f}")
         
-        print("\nOriginal vs Compensated Std Dev:")
-        for i, name in enumerate(channel_names):
-            orig = eval_dict["original_std"][i]
-            comp = eval_dict["compensated_std"][i]
-            print(f"  {name}: {orig:.4f} → {comp:.4f}")
+        if channel_metrics:
+            print("\nPer-Channel Metrics:")
+            for ch_metrics in channel_metrics:
+                ch = ch_metrics.get("channel", 0)
+                print(f"  Channel {ch+1}:")
+                print(f"    MAE: {ch_metrics.get('mae', 0):.1f}")
+                print(f"    RMSE: {ch_metrics.get('rmse', 0):.1f}")
+                print(f"    Max error: {ch_metrics.get('max_error', 0):.1f}")
+                print(f"    Std reduction: {ch_metrics.get('std_reduction', 0):.1f}")
         
-        if "baseline_mse" in eval_dict:
-            print(f"\nBaseline Prediction MSE: {eval_dict['baseline_mse']:.6f}")
-            print(f"Baseline Prediction MAE: {eval_dict['baseline_mae']:.6f}")
-        
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")

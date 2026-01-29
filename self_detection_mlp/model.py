@@ -1,667 +1,441 @@
-"""MLP models for Self Detection - Two-Stage Compensation.
-
-Based on README specifications:
-- Input: 6 joint angles (j1-j6)
-- Output: 4 sensor raw values (raw1-raw4)
-- Stage 1: Static posture-dependent baseline model
-- Stage 2: Short-term memory residual model
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+Unified Self-Detection Models (Single Lineage)
+
+✅ 목표
+- "논문 계보(1번)"의 의미로 Stage 계보(2번)를 정렬/흡수
+- 입력: 6 joint angles (q) ONLY
+- 출력: N sensors (raw)  ※ N=8(또는 16) 그대로 사용
+- 입력 정규화: 사용 안 함 (너의 요구)
+- 출력 정규화: baseline 기준 정규화(논문 방식)만 지원
+    y_norm = (y_raw - BASE_VALUE) / Y_SCALE
+
+❗ 핵심 개념 변화(중요)
+- 기존 Stage1StaticOffsetMLP(=baseline b(q)) 개념 폐기
+- Stage1은 "self-detection field" 전체를 예측:
+    ŝ(q) ≈ y_raw (obstacle-free)
+  학습은 보통 baseline 기준 정규화된 y_norm을 타깃으로 한다.
+
+보상(실시간)에서의 표준 수식:
+    y_pred_raw = y_pred_norm * Y_SCALE + BASE_VALUE
+    y_comp     = y_meas - (y_pred_raw - BASE_VALUE)
+              = y_meas - y_pred_raw + BASE_VALUE
+"""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from typing import Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, List
 
 
-class Stage1StaticOffsetMLP(nn.Module):
-    """Stage 1: Static posture-dependent baseline model.
+# =============================================================================
+# Normalization Spec (Output-only)
+# =============================================================================
 
-    Learns: b(q) = static offset as function of joint angles
+@dataclass(frozen=True)
+class OutputNormSpec:
+    """Output normalization spec: baseline + scale."""
+    baseline: float = 4e7
+    scale: float = 1e6
 
-    Architecture (from README):
-        Input(6) → Dense(32) + ReLU → Dense(32) + ReLU → Dense(32) + ReLU → Dense(4)
+    def normalize(self, y_raw: torch.Tensor) -> torch.Tensor:
+        return (y_raw - self.baseline) / self.scale
 
-    Purpose:
-        Remove the main posture-dependent baseline fluctuations (36-73% variance reduction).
+    def denormalize(self, y_norm: torch.Tensor) -> torch.Tensor:
+        return y_norm * self.scale + self.baseline
+
+
+# =============================================================================
+# Stage 1 (Unified): Self-Detection Field MLP
+# =============================================================================
+
+class Stage1SelfDetectionFieldMLP(nn.Module):
+    """
+    Stage 1: Self-Detection Field Model
+
+    Input : q (6 joint angles), shape (B, 6)   [NO input normalization]
+    Output: y_pred_norm (N sensors), shape (B, N)
+            where y_pred_norm ≈ (y_raw - BASE_VALUE) / Y_SCALE
     """
 
-    def __init__(self, input_dim: int = 6, output_dim: int = 4,
-                 hidden_dim: int = 32, num_layers: int = 3, dropout: float = 0.0):
-        """Initialize Stage 1 MLP.
-
-        Args:
-            input_dim: Input dimension (6 joint angles: j1-j6)
-            output_dim: Output dimension (4 sensors: raw1-raw4)
-            hidden_dim: Hidden layer dimension (default 32)
-            num_layers: Number of hidden layers (default 3)
-            dropout: Dropout rate (default 0.0, not used in README spec)
-        """
+    def __init__(
+        self,
+        input_dim: int = 6,
+        output_dim: int = 8,
+        hidden_dims: Tuple[int, ...] = (256, 256, 128),
+        activation: str = "relu",
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
+        self.hidden_dims = tuple(hidden_dims)
+        self.activation = activation
+        self.dropout = float(dropout)
 
-        # Build network
-        layers = []
+        act = {
+            "relu": nn.ReLU(inplace=True),
+            "tanh": nn.Tanh(),
+            "leaky_relu": nn.LeakyReLU(0.1, inplace=True),
+        }.get(activation, nn.ReLU(inplace=True))
 
-        # Input layer
-        layers.append(nn.Linear(input_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-
-        # Hidden layers
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-
-        # Output layer
-        layers.append(nn.Linear(hidden_dim, output_dim))
+        layers: List[nn.Module] = []
+        d = input_dim
+        for h in self.hidden_dims:
+            layers.append(nn.Linear(d, h))
+            layers.append(act)
+            if self.dropout > 0:
+                layers.append(nn.Dropout(self.dropout))
+            d = h
+        layers.append(nn.Linear(d, output_dim))
 
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: predict static offset b(q).
-
-        Args:
-            x: Joint angles, shape (batch_size, 6)
-
-        Returns:
-            Predicted static offset (normalized), shape (batch_size, 4)
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
         """
-        return self.net(x)
+        Args:
+            q: (B, 6) joint angles (raw, not normalized)
+        Returns:
+            y_pred_norm: (B, output_dim)
+        """
+        return self.net(q)
 
-    def get_config(self) -> dict:
+    def get_config(self) -> Dict:
         return {
-            "model": "Stage1StaticOffsetMLP",
+            "model": "Stage1SelfDetectionFieldMLP",
             "input_dim": self.input_dim,
             "output_dim": self.output_dim,
-            "hidden_dim": self.hidden_dim,
-            "num_layers": self.num_layers,
+            "hidden_dims": list(self.hidden_dims),
+            "activation": self.activation,
+            "dropout": self.dropout,
         }
 
 
-class Stage2ResidualMemoryMLP(nn.Module):
-    """Stage 2: Short-term memory residual model.
+class Stage1SelfDetectionTrunkHeadMLP(nn.Module):
+    """
+    Stage 1 (optional): Trunk + Head 구조 (채널별 특성 분리)
 
-    Learns: r̂(t) = g(r(t-1), r(t-2), ..., r(t-K))
+    - Trunk: 공유 representation
+    - Head : 채널별 1D 회귀기
 
-    Purpose:
-        Remove hysteresis and dielectric relaxation effects from residual signal.
-
-    Input: Residual history only (NOT raw signal, NOT joint angles)
-
-    Design constraints (from README):
-        - Small network (8-16 hidden units)
-        - Short memory window (K=3-10 samples ≈ 30-100 ms)
-        - Prevents raw signal following behavior
+    Input : (B, 6)
+    Output: (B, N) normalized
     """
 
-    def __init__(self, memory_window: int = 5, output_dim: int = 4,
-                 hidden_dim: int = 12, dropout: float = 0.0):
-        """Initialize Stage 2 Memory MLP.
-
-        Args:
-            memory_window: Number of past residual samples to use (K=3-10)
-            output_dim: Output dimension (4 sensors)
-            hidden_dim: Hidden dimension (8-16 recommended)
-            dropout: Dropout rate
-        """
+    def __init__(
+        self,
+        input_dim: int = 6,
+        output_dim: int = 8,
+        trunk_hidden: Tuple[int, ...] = (256, 256),
+        trunk_dim: int = 128,
+        head_hidden: int = 64,
+        activation: str = "relu",
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.memory_window = memory_window
+        self.input_dim = input_dim
         self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
+        self.trunk_hidden = tuple(trunk_hidden)
+        self.trunk_dim = int(trunk_dim)
+        self.head_hidden = int(head_hidden)
+        self.activation = activation
+        self.dropout = float(dropout)
 
-        # Input: memory_window * 4 (4 sensor residuals × K past samples)
-        input_dim = memory_window * output_dim
+        act = {
+            "relu": nn.ReLU(inplace=True),
+            "tanh": nn.Tanh(),
+            "leaky_relu": nn.LeakyReLU(0.1, inplace=True),
+        }.get(activation, nn.ReLU(inplace=True))
+
+        # trunk
+        layers: List[nn.Module] = []
+        d = input_dim
+        for h in self.trunk_hidden:
+            layers.append(nn.Linear(d, h))
+            layers.append(act)
+            if self.dropout > 0:
+                layers.append(nn.Dropout(self.dropout))
+            d = h
+        layers.append(nn.Linear(d, self.trunk_dim))
+        layers.append(act)
+        self.trunk = nn.Sequential(*layers)
+
+        # heads
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.trunk_dim, self.head_hidden),
+                act,
+                nn.Linear(self.head_hidden, 1),
+            )
+            for _ in range(output_dim)
+        ])
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        z = self.trunk(q)  # (B, trunk_dim)
+        ys = [head(z) for head in self.heads]  # list[(B,1)]
+        return torch.cat(ys, dim=1)  # (B, N)
+
+    def get_config(self) -> Dict:
+        return {
+            "model": "Stage1SelfDetectionTrunkHeadMLP",
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "trunk_hidden": list(self.trunk_hidden),
+            "trunk_dim": self.trunk_dim,
+            "head_hidden": self.head_hidden,
+            "activation": self.activation,
+            "dropout": self.dropout,
+        }
+
+
+# =============================================================================
+# Stage 2 (Residual-only): Memory MLP / Residual TCN
+# =============================================================================
+
+class Stage2ResidualMemoryMLP(nn.Module):
+    """
+    Stage 2: Residual-only Memory MLP
+
+    Input : residual history only (NO joint angles, NO raw)
+            r_hist shape (B, K, N) or (B, K*N)
+    Output: residual correction r_hat(t) (B, N)
+
+    NOTE:
+    - 이 Stage2는 '손 신호를 지우지 않기' 위해
+      구조적으로 raw-following 되지 않게(작게) 유지해야 한다.
+    """
+
+    def __init__(
+        self,
+        memory_window: int = 5,
+        output_dim: int = 8,
+        hidden_dim: int = 12,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.memory_window = int(memory_window)
+        self.output_dim = int(output_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+
+        in_dim = self.memory_window * self.output_dim
 
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(in_dim, self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.dropout) if self.dropout > 0 else nn.Identity(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.dropout) if self.dropout > 0 else nn.Identity(),
+            nn.Linear(self.hidden_dim, self.output_dim),
         )
 
     def forward(self, residual_history: torch.Tensor) -> torch.Tensor:
-        """Forward pass: predict residual correction r̂(t).
-
-        Args:
-            residual_history: Past residuals, shape (batch_size, memory_window, 4)
-                              or flattened (batch_size, memory_window * 4)
-
-        Returns:
-            Predicted residual correction, shape (batch_size, 4)
-        """
-        # Flatten if needed: (batch_size, memory_window, 4) → (batch_size, memory_window*4)
         if residual_history.dim() == 3:
-            batch_size = residual_history.shape[0]
-            residual_history = residual_history.reshape(batch_size, -1)
-
+            b = residual_history.shape[0]
+            residual_history = residual_history.reshape(b, -1)
         return self.net(residual_history)
 
-    def get_config(self) -> dict:
+    def get_config(self) -> Dict:
         return {
             "model": "Stage2ResidualMemoryMLP",
             "memory_window": self.memory_window,
             "output_dim": self.output_dim,
             "hidden_dim": self.hidden_dim,
-        }
-
-
-class TwoStageCompensator(nn.Module):
-    """Combined Two-Stage Self Detection Compensator.
-
-    Compensation formula:
-        y_corrected(t) = raw(t) - b̂(q(t)) - r̂(t)
-
-    Where:
-        - b̂(q) = Stage 1 output (static baseline)
-        - r̂(t) = Stage 2 output (residual correction)
-    """
-
-    def __init__(self, stage1: Stage1StaticOffsetMLP, stage2: Stage2ResidualMemoryMLP = None):
-        """Initialize Two-Stage Compensator.
-
-        Args:
-            stage1: Trained Stage 1 model
-            stage2: Trained Stage 2 model (optional)
-        """
-        super().__init__()
-        self.stage1 = stage1
-        self.stage2 = stage2
-
-    def forward(self, joint_angles: torch.Tensor,
-                residual_history: torch.Tensor = None) -> tuple:
-        """Forward pass through both stages.
-
-        Args:
-            joint_angles: Current joint angles, shape (batch_size, 6)
-            residual_history: Past residuals for Stage 2, shape (batch_size, K, 4)
-
-        Returns:
-            tuple: (stage1_output, stage2_output or None)
-        """
-        stage1_out = self.stage1(joint_angles)
-
-        stage2_out = None
-        if self.stage2 is not None and residual_history is not None:
-            stage2_out = self.stage2(residual_history)
-
-        return stage1_out, stage2_out
-
-
-# Legacy alias for backward compatibility
-class SelfDetectionMLP(Stage1StaticOffsetMLP):
-    """Legacy alias for Stage1StaticOffsetMLP."""
-    pass
-
-
-# ============================================================================
-# Additional Model Architectures
-# ============================================================================
-
-class SimpleMLP(nn.Module):
-    """Simple MLP with configurable architecture.
-
-    A basic feedforward network for quick experiments.
-    """
-
-    def __init__(self, input_dim: int = 6, output_dim: int = 4,
-                 hidden_dims: list = [64, 32], activation: str = "relu"):
-        """Initialize Simple MLP.
-
-        Args:
-            input_dim: Input dimension
-            output_dim: Output dimension
-            hidden_dims: List of hidden layer dimensions
-            activation: Activation function ("relu", "tanh", "leaky_relu")
-        """
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.hidden_dims = hidden_dims
-
-        # Select activation
-        act_fn = {
-            "relu": nn.ReLU(),
-            "tanh": nn.Tanh(),
-            "leaky_relu": nn.LeakyReLU(0.1),
-        }.get(activation, nn.ReLU())
-
-        # Build layers
-        layers = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(act_fn)
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, output_dim))
-
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-    def get_config(self) -> dict:
-        return {
-            "model": "SimpleMLP",
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-            "hidden_dims": self.hidden_dims,
+            "dropout": self.dropout,
         }
 
 
 class TCNBlock(nn.Module):
-    """Temporal Convolutional Network Block.
+    """Dilated causal conv block with residual connection."""
 
-    Dilated causal convolution with residual connection.
-    Based on "An Empirical Evaluation of Generic Convolutional and
-    Recurrent Networks for Sequence Modeling" (Bai et al., 2018).
-    """
-
-    def __init__(self, c_in: int, c_out: int, kernel_size: int = 3,
-                 dilation: int = 1, dropout: float = 0.2):
-        """Initialize TCN Block.
-
-        Args:
-            c_in: Input channels
-            c_out: Output channels
-            kernel_size: Convolution kernel size
-            dilation: Dilation factor for causal convolution
-            dropout: Dropout rate
-        """
+    def __init__(
+        self,
+        c_in: int,
+        c_out: int,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         pad = (kernel_size - 1) * dilation
 
-        self.conv1 = nn.Conv1d(c_in, c_out, kernel_size=kernel_size,
-                               padding=pad, dilation=dilation)
-        self.act1 = nn.ReLU()
+        self.conv1 = nn.Conv1d(c_in, c_out, kernel_size, padding=pad, dilation=dilation)
+        self.act1 = nn.ReLU(inplace=True)
         self.drop1 = nn.Dropout(dropout)
 
-        self.conv2 = nn.Conv1d(c_out, c_out, kernel_size=kernel_size,
-                               padding=pad, dilation=dilation)
-        self.act2 = nn.ReLU()
+        self.conv2 = nn.Conv1d(c_out, c_out, kernel_size, padding=pad, dilation=dilation)
+        self.act2 = nn.ReLU(inplace=True)
         self.drop2 = nn.Dropout(dropout)
 
-        # Residual connection (downsample if channels differ)
         self.downsample = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor, shape (batch, channels, seq_len)
-
-        Returns:
-            Output tensor, shape (batch, c_out, seq_len)
-        """
-        # First conv + causal crop
+        # x: (B, C, T)
         y = self.conv1(x)
-        y = y[..., :x.size(-1)]  # Causal: crop to input length
+        y = y[..., :x.size(-1)]  # causal crop
         y = self.drop1(self.act1(y))
 
-        # Second conv + causal crop
         y = self.conv2(y)
         y = y[..., :x.size(-1)]
         y = self.drop2(self.act2(y))
 
-        # Residual connection
         return y + self.downsample(x)
 
 
 class Stage2ResidualTCN(nn.Module):
     """
-    Stage 2: Residual-only Temporal Convolutional Network.
+    Stage 2: Residual-only TCN
 
-    Learns:
-        r̂(t) = g(r(t-1), r(t-2), ..., r(t-K))
-
-    ✔ Input  : residual history only (NO joint angles, NO raw)
-    ✔ Output : residual correction at current time step
-    ✔ Role   : Replace Stage2ResidualMemoryMLP with temporal model
+    Input : residual_seq shape (B, K, N)  (r(t-K) ... r(t-1))
+    Output: r_hat(t) shape (B, N)
     """
 
     def __init__(
         self,
-        input_dim: int = 4,          # residual dimension (fixed)
-        output_dim: int = 4,
-        seq_len: int = 5,            # memory window K
-        channels: tuple = (32, 32),
+        input_dim: int = 8,
+        output_dim: int = 8,
+        seq_len: int = 5,
+        channels: Tuple[int, ...] = (32, 32),
         kernel_size: int = 3,
         dropout: float = 0.1,
     ):
         super().__init__()
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.seq_len = int(seq_len)
+        self.channels = tuple(channels)
+        self.kernel_size = int(kernel_size)
+        self.dropout = float(dropout)
 
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.seq_len = seq_len
-        self.channels = channels
-        self.kernel_size = kernel_size
-
-        # -----------------------------
-        # Build TCN blocks
-        # -----------------------------
-        layers = []
-        c_in = input_dim
+        layers: List[nn.Module] = []
+        c_in = self.input_dim
         dilation = 1
-
-        for c_out in channels:
-            layers.append(
-                TCNBlock(
-                    c_in=c_in,
-                    c_out=c_out,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    dropout=dropout,
-                )
-            )
+        for c_out in self.channels:
+            layers.append(TCNBlock(c_in, c_out, kernel_size=self.kernel_size, dilation=dilation, dropout=self.dropout))
             c_in = c_out
-            dilation *= 2  # exponential dilation
+            dilation *= 2
 
         self.tcn = nn.Sequential(*layers)
-
-        # Output projection (1x1 conv)
-        self.head = nn.Conv1d(c_in, output_dim, kernel_size=1)
+        self.head = nn.Conv1d(c_in, self.output_dim, kernel_size=1)
 
     def forward(self, residual_seq: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            residual_seq:
-                shape (batch, seq_len, 4)
-                r(t-K) ... r(t-1)
-
-        Returns:
-            residual correction r̂(t)
-                shape (batch, 4)
-        """
-        # (B, T, C) -> (B, C, T)
+        # (B, K, N) -> (B, N, K)
         x = residual_seq.transpose(1, 2)
+        z = self.tcn(x)         # (B, C, K)
+        y = self.head(z)        # (B, N, K)
+        return y[..., -1]       # (B, N)
 
-        # TCN
-        z = self.tcn(x)              # (B, C', T)
-
-        # Output head
-        y = self.head(z)             # (B, 4, T)
-
-        # Return last time step only
-        return y[..., -1]
-
-    def get_config(self) -> dict:
+    def get_config(self) -> Dict:
         return {
             "model": "Stage2ResidualTCN",
             "input_dim": self.input_dim,
             "output_dim": self.output_dim,
             "seq_len": self.seq_len,
-            "channels": self.channels,
+            "channels": list(self.channels),
             "kernel_size": self.kernel_size,
+            "dropout": self.dropout,
         }
 
 
-class TCN(nn.Module):
-    """Temporal Convolutional Network for sequence-to-one regression.
+# =============================================================================
+# Optional Wrapper (Two-Stage)
+# =============================================================================
 
-    Takes a sequence of inputs and predicts output at the last time step.
-    Suitable for self-detection with temporal dependencies.
+class TwoStageCompensator(nn.Module):
+    """
+    Two-stage compensator wrapper.
 
-    Architecture:
-        Input(seq_len, in_dim) -> TCNBlocks with increasing dilation -> Output(out_dim)
+    stage1: predicts normalized self-detection field ŝ_norm(q)
+    stage2: predicts residual correction r̂(t) (same normalized scale), optional
+
+    This module returns normalized predictions.
+    Denormalize outside using OutputNormSpec.
     """
 
-    def __init__(self, input_dim: int = 6, output_dim: int = 4,
-                 channels: tuple = (64, 64, 64, 64), kernel_size: int = 3,
-                 dropout: float = 0.2):
-        """Initialize TCN.
-
-        Args:
-            input_dim: Input feature dimension (e.g., 6 joint angles)
-            output_dim: Output dimension (e.g., 4 raw sensors)
-            channels: Tuple of channel sizes for each TCN block
-            kernel_size: Convolution kernel size
-            dropout: Dropout rate
-        """
+    def __init__(
+        self,
+        stage1: nn.Module,
+        stage2: Optional[nn.Module] = None,
+    ):
         super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.channels = channels
-        self.kernel_size = kernel_size
+        self.stage1 = stage1
+        self.stage2 = stage2
 
-        # Build TCN layers with exponentially increasing dilation
-        layers = []
-        c_in = input_dim
-        dilation = 1
-        for c_out in channels:
-            layers.append(TCNBlock(c_in, c_out, kernel_size, dilation, dropout))
-            c_in = c_out
-            dilation *= 2  # Exponential dilation: 1, 2, 4, 8, ...
-
-        self.net = nn.Sequential(*layers)
-
-        # Output head: 1x1 conv to map to output dimension
-        self.head = nn.Conv1d(c_in, output_dim, kernel_size=1)
-
-    def forward(self, x_seq: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x_seq: Input sequence, shape (batch, seq_len, input_dim)
-
-        Returns:
-            Output at last time step, shape (batch, output_dim)
-        """
-        # Transpose: (B, T, C) -> (B, C, T) for Conv1d
-        x = x_seq.transpose(1, 2)
-
-        # TCN layers
-        z = self.net(x)  # (B, channels[-1], T)
-
-        # Output head
-        y = self.head(z)  # (B, output_dim, T)
-
-        # Return last time step only
-        return y[..., -1]  # (B, output_dim)
-
-    def get_config(self) -> dict:
-        return {
-            "model": "TCN",
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-            "channels": self.channels,
-            "kernel_size": self.kernel_size,
-        }
+    def forward(
+        self,
+        joint_angles: torch.Tensor,
+        residual_history: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        y1 = self.stage1(joint_angles)
+        y2 = None
+        if self.stage2 is not None and residual_history is not None:
+            y2 = self.stage2(residual_history)
+        return y1, y2
 
 
-class TCNLight(nn.Module):
-    """Lightweight TCN for faster inference.
-
-    Smaller architecture suitable for real-time applications.
-    """
-
-    def __init__(self, input_dim: int = 6, output_dim: int = 4,
-                 channels: tuple = (32, 32), kernel_size: int = 3,
-                 dropout: float = 0.1):
-        """Initialize lightweight TCN."""
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.channels = channels
-
-        layers = []
-        c_in = input_dim
-        dilation = 1
-        for c_out in channels:
-            layers.append(TCNBlock(c_in, c_out, kernel_size, dilation, dropout))
-            c_in = c_out
-            dilation *= 2
-
-        self.net = nn.Sequential(*layers)
-        self.head = nn.Conv1d(c_in, output_dim, kernel_size=1)
-
-    def forward(self, x_seq: torch.Tensor) -> torch.Tensor:
-        x = x_seq.transpose(1, 2)
-        z = self.net(x)
-        y = self.head(z)
-        return y[..., -1]
-
-    def get_config(self) -> dict:
-        return {
-            "model": "TCNLight",
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-            "channels": self.channels,
-        }
-
-
-class DeepMLP(nn.Module):
-    """Deeper MLP with residual connections and batch normalization.
-
-    For more complex patterns that need deeper networks.
-    """
-
-    def __init__(self, input_dim: int = 6, output_dim: int = 4,
-                 hidden_dim: int = 64, num_layers: int = 5,
-                 use_batch_norm: bool = True, dropout: float = 0.1):
-        """Initialize Deep MLP.
-
-        Args:
-            input_dim: Input dimension
-            output_dim: Output dimension
-            hidden_dim: Hidden layer dimension
-            num_layers: Number of hidden layers
-            use_batch_norm: Whether to use batch normalization
-            dropout: Dropout rate
-        """
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-
-        # Input projection
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-
-        # Hidden layers with optional residual connections
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim) if use_batch_norm else nn.Identity(),
-                nn.ReLU(),
-                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            )
-            self.layers.append(layer)
-
-        # Output projection
-        self.output_proj = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(x)
-        for layer in self.layers:
-            residual = x
-            x = layer(x)
-            x = x + residual  # Residual connection
-        return self.output_proj(x)
-
-    def get_config(self) -> dict:
-        return {
-            "model": "DeepMLP",
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-            "hidden_dim": self.hidden_dim,
-            "num_layers": self.num_layers,
-        }
-
-
-# ============================================================================
-# Model Registry
-# ============================================================================
+# =============================================================================
+# Model Registry (Cleaned)
+# =============================================================================
 
 class ModelRegistry:
-    """Registry for available models.
+    """
+    Clean registry aligned with "논문 계보" meaning.
 
-    Allows easy selection and instantiation of different model architectures.
+    - stage1_field_mlp        : recommended default (256-256-128)
+    - stage1_trunk_head_mlp   : optional per-channel head model
+    - stage2_memory           : residual-only memory MLP
+    - stage2_tcn              : residual-only TCN
     """
 
     MODELS = {
-        "stage1_mlp": {
-            "class": Stage1StaticOffsetMLP,
-            "description": "Stage 1: Static baseline MLP (6 joints -> 4 sensors)",
+        "stage1_field_mlp": {
+            "class": Stage1SelfDetectionFieldMLP,
+            "description": "Stage1: Self-detection field MLP (q -> sensors, output normalized by baseline/scale)",
             "default_config": {
                 "input_dim": 6,
-                "output_dim": 4,
-                "hidden_dim": 32,
-                "num_layers": 3,
+                "output_dim": 8,
+                "hidden_dims": (256, 256, 128),
+                "activation": "relu",
+                "dropout": 0.0,
+            },
+            "requires_sequence": False,
+        },
+        "stage1_trunk_head_mlp": {
+            "class": Stage1SelfDetectionTrunkHeadMLP,
+            "description": "Stage1: Trunk+Head self-detection MLP (q -> sensors, normalized)",
+            "default_config": {
+                "input_dim": 6,
+                "output_dim": 8,
+                "trunk_hidden": (256, 256),
+                "trunk_dim": 128,
+                "head_hidden": 64,
+                "activation": "relu",
+                "dropout": 0.0,
             },
             "requires_sequence": False,
         },
         "stage2_memory": {
             "class": Stage2ResidualMemoryMLP,
-            "description": "Stage 2: Residual memory MLP for hysteresis correction",
+            "description": "Stage2: Residual-only memory MLP (residual history -> residual correction)",
             "default_config": {
                 "memory_window": 5,
-                "output_dim": 4,
+                "output_dim": 8,
                 "hidden_dim": 12,
+                "dropout": 0.0,
             },
             "requires_sequence": True,
         },
         "stage2_tcn": {
             "class": Stage2ResidualTCN,
-            "description": "Stage 2: Residual TCN for temporal hysteresis correction",
+            "description": "Stage2: Residual-only TCN (residual seq -> residual correction)",
             "default_config": {
-                "input_dim": 4,
-                "output_dim": 4,
+                "input_dim": 8,
+                "output_dim": 8,
                 "seq_len": 5,
-                "channels": (32, 32),
-                "kernel_size": 3,
-                "dropout": 0.1,
-            },
-            "requires_sequence": True,
-        },
-        "simple_mlp": {
-            "class": SimpleMLP,
-            "description": "Simple MLP with configurable hidden layers",
-            "default_config": {
-                "input_dim": 6,
-                "output_dim": 4,
-                "hidden_dims": [64, 32],
-            },
-            "requires_sequence": False,
-        },
-        "deep_mlp": {
-            "class": DeepMLP,
-            "description": "Deep MLP with residual connections and batch norm",
-            "default_config": {
-                "input_dim": 6,
-                "output_dim": 4,
-                "hidden_dim": 64,
-                "num_layers": 5,
-            },
-            "requires_sequence": False,
-        },
-        "tcn": {
-            "class": TCN,
-            "description": "TCN: Temporal Convolutional Network (sequence model)",
-            "default_config": {
-                "input_dim": 6,
-                "output_dim": 4,
-                "channels": (64, 64, 64, 64),
-                "kernel_size": 3,
-                "dropout": 0.2,
-            },
-            "requires_sequence": True,
-        },
-        "tcn_light": {
-            "class": TCNLight,
-            "description": "TCN Light: Lightweight TCN for real-time inference",
-            "default_config": {
-                "input_dim": 6,
-                "output_dim": 4,
                 "channels": (32, 32),
                 "kernel_size": 3,
                 "dropout": 0.1,
@@ -672,55 +446,96 @@ class ModelRegistry:
 
     @classmethod
     def list_models(cls) -> None:
-        """Print available models."""
         print("\nAvailable Models:")
-        print("-" * 60)
+        print("-" * 80)
         for name, info in cls.MODELS.items():
-            print(f"  {name:15s} : {info['description']}")
-        print()
+            print(f"  {name:22s} : {info['description']}")
+        print("-" * 80)
 
     @classmethod
-    def get_model_info(cls, name: str) -> dict:
-        """Get model information."""
+    def get_model_info(cls, name: str) -> Dict:
         if name not in cls.MODELS:
             raise ValueError(f"Unknown model: {name}. Available: {list(cls.MODELS.keys())}")
         return cls.MODELS[name]
 
     @classmethod
     def create_model(cls, name: str, **kwargs) -> nn.Module:
-        """Create a model instance.
-
-        Args:
-            name: Model name from registry
-            **kwargs: Override default config parameters
-
-        Returns:
-            Instantiated model
-        """
-        if name not in cls.MODELS:
-            raise ValueError(f"Unknown model: {name}. Available: {list(cls.MODELS.keys())}")
-
-        model_info = cls.MODELS[name]
-        config = model_info["default_config"].copy()
-        config.update(kwargs)
-
-        return model_info["class"](**config)
+        info = cls.get_model_info(name)
+        cfg = dict(info["default_config"])
+        cfg.update(kwargs)
+        return info["class"](**cfg)
 
     @classmethod
-    def get_available_models(cls) -> list:
-        """Get list of available model names."""
+    def get_available_models(cls) -> List[str]:
         return list(cls.MODELS.keys())
 
     @classmethod
     def requires_sequence(cls, name: str) -> bool:
-        """Check if model requires sequence input.
+        return cls.get_model_info(name).get("requires_sequence", False)
 
-        Args:
-            name: Model name
 
-        Returns:
-            True if model needs sequence data (e.g., TCN), False for single-step models
-        """
-        if name not in cls.MODELS:
-            raise ValueError(f"Unknown model: {name}")
-        return cls.MODELS[name].get("requires_sequence", False)
+# =============================================================================
+# Backward compatibility shims (older code/checkpoints)
+# =============================================================================
+
+class SimpleMLP(Stage1SelfDetectionFieldMLP):
+    """Backward compatible alias for older checkpoints/configs.
+
+    Older code used `SimpleMLP` with hidden_dims=[256,256,128] and output in either:
+    - z-score normalized space (with `norm_params` in checkpoint), or
+    - raw space (rare)
+
+    The architecture matches Stage1SelfDetectionFieldMLP.
+    """
+
+    def get_config(self) -> Dict:
+        cfg = super().get_config()
+        cfg["model"] = "SimpleMLP"
+        return cfg
+
+
+class Stage1StaticOffsetMLP(nn.Module):
+    """Legacy Stage1 baseline MLP (kept for compatibility with older scripts).
+
+    Architecture: (B,6) -> ... -> (B,output_dim)
+    using a repeated hidden_dim for num_layers.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 6,
+        output_dim: int = 8,
+        hidden_dim: int = 32,
+        num_layers: int = 3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.dropout = float(dropout)
+
+        layers: List[nn.Module] = []
+        d = self.input_dim
+        for _ in range(self.num_layers):
+            layers.append(nn.Linear(d, self.hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            if self.dropout > 0:
+                layers.append(nn.Dropout(self.dropout))
+            d = self.hidden_dim
+        layers.append(nn.Linear(d, self.output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        return self.net(q)
+
+    def get_config(self) -> Dict:
+        return {
+            "model": "Stage1StaticOffsetMLP",
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "hidden_dim": self.hidden_dim,
+            "num_layers": self.num_layers,
+            "dropout": self.dropout,
+        }

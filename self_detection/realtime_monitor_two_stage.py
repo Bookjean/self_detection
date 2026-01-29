@@ -53,11 +53,12 @@ class RealtimeMonitorTwoStage(Node):
         self.cb_group = ReentrantCallbackGroup()
 
         # Data
-        self.raw_data = [0.0] * 4
+        self.num_sensors = 8  # 8개 센서 지원 (기존 4개와 호환)
+        self.raw_data = [0.0] * self.num_sensors
         self.joint_states = None
         self.joint_names = None
         self.raw_received = False
-        self.raw_timestamps = [None] * 4  # 각 센서의 타임스탬프
+        self.raw_timestamps = [None] * self.num_sensors  # 각 센서의 타임스탬프
         self.joint_timestamp = None  # 관절 상태 타임스탬프
 
         # Models
@@ -83,8 +84,8 @@ class RealtimeMonitorTwoStage(Node):
         else:
             self.get_logger().error('PyTorch NOT available! Models cannot be loaded.')
 
-        # Subscribers
-        for i in range(1, 5):
+        # Subscribers (8개 센서 지원)
+        for i in range(1, self.num_sensors + 1):
             self.create_subscription(
                 Range,
                 f'/raw_distance{i}',
@@ -102,10 +103,10 @@ class RealtimeMonitorTwoStage(Node):
         )
 
         # ===============================
-        # Publishers for compensated values
+        # Publishers for compensated values (8개 센서)
         # ===============================
         self.compensated_publishers = []
-        for i in range(1, 5):
+        for i in range(1, self.num_sensors + 1):
             pub = self.create_publisher(
                 Range,
                 f'/compensated_distance{i}',
@@ -137,9 +138,9 @@ class RealtimeMonitorTwoStage(Node):
         self.get_logger().info('=' * 60)
         self.get_logger().info('Two-Stage Self Detection Realtime Monitor')
         self.get_logger().info(f'Logging all topics @100Hz → {self.log_path}')
-        self.get_logger().info('Saved data: timestamp, j1~j6, raw1~4, compensated1~4, stage1_out1~4, stage2_out1~4')
+        self.get_logger().info(f'Saved data: timestamp, j1~j6, raw1~{self.num_sensors}, compensated1~{self.num_sensors}, stage1_out1~{self.num_sensors}, stage2_out1~{self.num_sensors}')
         self.get_logger().info('Publishing compensated values:')
-        for i in range(1, 5):
+        for i in range(1, self.num_sensors + 1):
             self.get_logger().info(f'  /compensated_distance{i}')
         
         # 모델 로드 상태 확인
@@ -172,8 +173,12 @@ class RealtimeMonitorTwoStage(Node):
         
         try:
             self.log_file = open(self.log_path, 'w')
-            # 헤더: timestamp, j1~j6, raw1~4, compensated1~4, stage1_out1~4, stage2_out1~4
-            header = '# timestamp j1 j2 j3 j4 j5 j6 raw1 raw2 raw3 raw4 compensated1 compensated2 compensated3 compensated4 stage1_out1 stage1_out2 stage1_out3 stage1_out4 stage2_out1 stage2_out2 stage2_out3 stage2_out4\n'
+            # 헤더: timestamp, j1~j6, raw1~8, compensated1~8, stage1_out1~8, stage2_out1~8
+            raw_cols = " ".join([f"raw{i}" for i in range(1, self.num_sensors + 1)])
+            comp_cols = " ".join([f"compensated{i}" for i in range(1, self.num_sensors + 1)])
+            stage1_cols = " ".join([f"stage1_out{i}" for i in range(1, self.num_sensors + 1)])
+            stage2_cols = " ".join([f"stage2_out{i}" for i in range(1, self.num_sensors + 1)])
+            header = f'# timestamp j1 j2 j3 j4 j5 j6 {raw_cols} {comp_cols} {stage1_cols} {stage2_cols}\n'
             self.log_file.write(header)
             self.log_file.flush()  # 헤더도 즉시 저장
             self.get_logger().info(f'Log file opened and header written: {self.log_path}')
@@ -287,9 +292,20 @@ class RealtimeMonitorTwoStage(Node):
             state = ckpt['model_state_dict']
             cfg = ckpt.get('model_config', {})
 
+            # 모델 체크포인트에서 output_dim 읽기, 없으면 8 사용
+            output_dim = cfg.get('output_dim', 8)
+            # 기존 모델(4개)과 호환: 체크포인트에서 읽은 값이 4면 그대로 사용
+            if output_dim != self.num_sensors:
+                self.get_logger().warn(
+                    f'Stage1 model output_dim ({output_dim}) != num_sensors ({self.num_sensors}). '
+                    f'Using model output_dim for compatibility.'
+                )
+                # 실제 사용할 센서 개수 조정 (모델이 4개면 4개만 사용)
+                self.num_sensors = output_dim
+            
             self.stage1_model = Stage1StaticOffsetMLP(
                 input_dim=cfg.get('input_dim', 6),
-                output_dim=cfg.get('output_dim', 4),
+                output_dim=output_dim,
                 hidden_dim=cfg.get('hidden_dim', 32),
                 num_layers=cfg.get('num_layers', 3),
             )
@@ -322,9 +338,13 @@ class RealtimeMonitorTwoStage(Node):
             state = ckpt['model_state_dict']
             cfg = ckpt.get('model_config', {})
 
+            # Stage2도 Stage1과 동일한 output_dim 사용
+            stage2_output_dim = cfg.get('output_dim', self.num_sensors)
+            stage2_input_dim = cfg.get('input_dim', self.num_sensors)
+            
             self.stage2_model = Stage2ResidualTCN(
-                input_dim=4,
-                output_dim=4,
+                input_dim=stage2_input_dim,
+                output_dim=stage2_output_dim,
                 seq_len=self.seq_len,
                 channels=tuple(cfg.get('channels', (32, 32))),
                 kernel_size=cfg.get('kernel_size', 3),
@@ -389,16 +409,29 @@ class RealtimeMonitorTwoStage(Node):
         if not self.raw_received:
             return None
 
-        raw = np.array(self.raw_data)
+        raw = np.array(self.raw_data[:self.num_sensors])
         stage1 = self._run_stage1()
         if stage1 is None:
             return None
+
+        # stage1 출력이 센서 개수와 다를 수 있음 (하위 호환)
+        if len(stage1) != self.num_sensors:
+            if len(stage1) < self.num_sensors:
+                stage1 = np.pad(stage1, (0, self.num_sensors - len(stage1)), 'constant')
+            else:
+                stage1 = stage1[:self.num_sensors]
 
         residual = raw - stage1
         self.residual_buffer.append(residual.copy())
 
         stage2 = self._run_stage2()
         if stage2 is not None:
+            # stage2 출력이 센서 개수와 다를 수 있음 (하위 호환)
+            if len(stage2) != self.num_sensors:
+                if len(stage2) < self.num_sensors:
+                    stage2 = np.pad(stage2, (0, self.num_sensors - len(stage2)), 'constant')
+                else:
+                    stage2 = stage2[:self.num_sensors]
             comp = raw - stage1 - stage2
         else:
             comp = raw - stage1
@@ -436,30 +469,42 @@ class RealtimeMonitorTwoStage(Node):
             joints = list(joints) + [0.0] * (6 - len(joints))
 
         # 원본 센서값
-        raw = np.array(self.raw_data)
+        raw = np.array(self.raw_data[:self.num_sensors])
 
         # Stage1 출력
         stage1_out = self._run_stage1()
         if stage1_out is None:
-            stage1_out = np.array([0.0] * 4)
+            stage1_out = np.array([0.0] * self.num_sensors)
         else:
             stage1_out = np.array(stage1_out)
+            # 모델 출력이 센서 개수와 다를 수 있음 (하위 호환)
+            if len(stage1_out) != self.num_sensors:
+                if len(stage1_out) < self.num_sensors:
+                    stage1_out = np.pad(stage1_out, (0, self.num_sensors - len(stage1_out)), 'constant')
+                else:
+                    stage1_out = stage1_out[:self.num_sensors]
 
         # Stage2 출력
         stage2_out = self._run_stage2()
         if stage2_out is None:
-            stage2_out = np.array([0.0] * 4)
+            stage2_out = np.array([0.0] * self.num_sensors)
         else:
             stage2_out = np.array(stage2_out)
+            # 모델 출력이 센서 개수와 다를 수 있음 (하위 호환)
+            if len(stage2_out) != self.num_sensors:
+                if len(stage2_out) < self.num_sensors:
+                    stage2_out = np.pad(stage2_out, (0, self.num_sensors - len(stage2_out)), 'constant')
+                else:
+                    stage2_out = stage2_out[:self.num_sensors]
 
         # 파일에 모든 데이터 저장
-        # timestamp, j1~j6, raw1~4, compensated1~4, stage1_out1~4, stage2_out1~4
+        # timestamp, j1~j6, raw1~8, compensated1~8, stage1_out1~8, stage2_out1~8
         line = f"{timestamp_sec:.9f} "  # timestamp
         line += " ".join([f"{j:.6f}" for j in joints]) + " "  # j1~j6
-        line += " ".join([f"{r:.6f}" for r in raw]) + " "  # raw1~4
-        line += " ".join([f"{c:.6f}" for c in result]) + " "  # compensated1~4
-        line += " ".join([f"{s1:.6f}" for s1 in stage1_out]) + " "  # stage1_out1~4
-        line += " ".join([f"{s2:.6f}" for s2 in stage2_out]) + "\n"  # stage2_out1~4
+        line += " ".join([f"{r:.6f}" for r in raw]) + " "  # raw1~8
+        line += " ".join([f"{c:.6f}" for c in result]) + " "  # compensated1~8
+        line += " ".join([f"{s1:.6f}" for s1 in stage1_out]) + " "  # stage1_out1~8
+        line += " ".join([f"{s2:.6f}" for s2 in stage2_out]) + "\n"  # stage2_out1~8
         
         if self.log_file is not None:
             try:
@@ -481,10 +526,12 @@ class RealtimeMonitorTwoStage(Node):
                 self._log_file_warn_count += 1
 
         # 토픽으로 publish
-        for i in range(4):
+        for i in range(min(self.num_sensors, len(result))):
             msg = Range()
             msg.header.stamp = now.to_msg()
             msg.header.frame_id = f'sensor{i+1}'
+            msg.radiation_type = 1  # INFRARED
+            msg.field_of_view = 0.0  # Single distance measurement
             msg.range = float(result[i])
             msg.min_range = 0.0
             msg.max_range = 1000.0  # 적절한 값으로 설정
